@@ -90,19 +90,35 @@ def build_curator_prompt(
 - 历史背景: 之前讨论过什么相关话题? 达成了什么共识?
 - 用户偏好: 用户对方案选择、代码风格有什么倾向?
 
-**0c. 缺口中识别**
+**0c. 缺口识别 & 多角度检索**
 逐一对照已有上下文段落——上述前置知识中, 哪些在当前上下文中缺失或不够?
 → 如果已有段落充分覆盖, 无需额外检索。
-→ 如果有缺口且属于跨会话长期记忆 (之前的项目决策、用户偏好、历史共识等), 在 `knowledge_gaps` 中发起 `memory` 检索。
+→ 如果缺口属于跨会话长期记忆 (之前的项目决策、用户偏好、历史共识等), 发起 `memory` 检索。给出 1 个主 query 和 2~3 个不同措辞/角度的同义变体 queries (帮助记忆系统提高召回率)。
 → 如果需要最新外部信息 (API 文档、版本更新等), 发起 `search` 检索。
 → 如果需要用户澄清意图或补充背景, 发起 `ask_user`。
 → 当前上下文已足够 → type: "none"。
+
+knowledge_gaps 中 memory 类型的格式:
+```
+{{"type": "memory", "query": "主查询", "queries": ["同义变体1", "同义变体2"], "reason": "缺失项目核心约束, 当前上下文无相关内容"}}
+```
+queries[0] 是主 query, 给单 query 接口做兜底; 多 query 接口使用完整列表。
 
 **0d. 策略更新**
 用户的关注焦点是否变化? 如有变化, 更新记忆管理策略作为后续评分的宏观指引。
 同时检查用户是否明确要求"记住"/"不要忘记"/"这条很重要"等——如有, 将对应段落的 id 加入 `pinned_segments`。
 
-输出字段: `strategy_update` (null 或新策略文本), `pinned_segments`, `knowledge_gaps`
+**0e. 持久化判定**
+判断每个段落是否包含需要跨会话保留的事实——这些内容应写入长期记忆供未来检索。
+判定标准:
+- 用户偏好/习惯: "以后都用pnpm"、"我不喜欢ORM"
+- 技术决策/约定: "选SQLite不用PostgreSQL"、"端口固定3000"
+- 关键事实: 人名、项目名、截止日期、已达成的重要共识
+- 不包含: 逻辑推理过程、临时代码片段、调试过程、闲聊
+persist ≠ 高长期分。一段逻辑推理可能长期分高但不需要跨会话记忆；一句"以后所有接口加限流"可能文本很短但需要 persist。
+输出字段: `persist_segments` (需要持久化的段落 ID 列表)
+
+输出字段: `strategy_update` (null 或新策略文本), `pinned_segments`, `knowledge_gaps`, `persist_segments`
 
 ### Step 1: 评分
 长期分和短期分是独立的两个维度——重要但不紧急的信息可以长期分高、短期分低(休眠), 反之亦然。
@@ -151,8 +167,9 @@ def build_curator_prompt(
     {{"segment_id": "ccc", "summary": "讨论了连接池配置, 决定使用 pgbouncer"}}
   ],
   "knowledge_gaps": [
-    {{"type": "none", "query": "", "reason": ""}}
-  ]
+    {{"type": "memory", "query": "主检索查询", "queries": ["同义变体1", "同义变体2"], "reason": "缺失内容说明"}}
+  ],
+  "persist_segments": ["seg_id_1", "seg_id_2"]
 }}
 ```
 
@@ -292,8 +309,10 @@ def parse_curator_output(raw: str) -> CuratorOutput:
             KnowledgeGap(
                 type=g.get("type", "none"),
                 query=g.get("query", ""),
+                queries=g.get("queries", []),
                 reason=g.get("reason", ""),
             )
             for g in data.get("knowledge_gaps", [])
         ],
+        persist_segments=data.get("persist_segments", []),
     )

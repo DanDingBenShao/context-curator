@@ -26,6 +26,7 @@ MODEL_WINDOWS = {
     "claude-opus-4-7":     200000,
     "claude-sonnet-4-6":   200000,
     "claude-haiku-4-5":    200000,
+    "deepseek-v4-pro":    1000000,
     "deepseek-v4-flash":   128000,
     "deepseek-chat":       128000,
     "deepseek-v3":         128000,
@@ -70,7 +71,8 @@ class ContextCurator:
             self._detect_host()
 
         # ── 3. 复杂度判断 ──
-        if self.gate.should_skip(user_message, self.segments):
+        if self.gate.should_skip(user_message, self.segments,
+                                 self.config.chars_per_token, dt):
             stats = self.segments.get_stats(self.config.chars_per_token, dt)
             self._write_log(turn=self.turn, user_message=user_message,
                            current_tokens=0, max_tokens=self.config.max_context_tokens,
@@ -101,6 +103,18 @@ class ContextCurator:
         llm_output = self._call_llm(prompt)
         parsed = parse_curator_output(llm_output)
 
+        # ── 成本追踪: Curator 自身消耗 ──
+        cp = self.config.chars_per_token
+        curator_prompt_tokens = int(len(prompt) / cp)
+        curator_resp_tokens = int(len(llm_output) / cp) if llm_output else 0
+
+        # ── 节省追踪: 删除前快照 ──
+        deletion_saved = 0
+        for seg_id in parsed.delete_segments:
+            seg = self.segments.get(seg_id)
+            if seg:
+                deletion_saved += int(len(seg.content) / cp)
+
         # ── 5. 应用删除 ──
         for seg_id in parsed.delete_segments:
             self.segments.delete(seg_id)
@@ -115,11 +129,17 @@ class ContextCurator:
         for seg_id in parsed.pinned_segments:
             self.segments.pin_segment(seg_id)
 
+        # ── 保存追踪: 压缩前快照 ──
+        compression_saved = 0
+
         # ── 7. 执行压缩 ──
         for comp in parsed.compressions:
             seg = self.segments.get(comp.segment_id)
             if seg is None:
                 continue
+            orig_tokens = int(len(seg.content) / cp)
+            summary_tokens = int(len(comp.summary) / cp)
+            compression_saved += max(0, orig_tokens - summary_tokens)
             idx_id = self.indexer.store(
                 seg.id, seg.content, comp.summary, self.turn
             )
@@ -133,7 +153,7 @@ class ContextCurator:
         gap_results = self._execute_gaps(parsed.knowledge_gaps)
         for gr in gap_results:
             self.segments.add(gr.content, gr.source_type, self.turn,
-                              score=10, short_term_score=5)
+                              score=10, short_term_score=7)
 
         # ── 10. 末尾淘汰兜底 (仅从活跃段落中删) ──
         self.segments.trim_by_tokens(
@@ -154,6 +174,29 @@ class ContextCurator:
         pending = _extract_pending_ask(gap_results)
         final_stats = self.segments.get_stats(self.config.chars_per_token, dt)
 
+        # ── 成本汇总 ──
+        # 休眠节省: 休眠段落不传给宿主, 省下的 token
+        dormant = self.segments.get_dormant(dt)
+        dormant_saved = sum(int(len(s.content) / cp) for s in dormant)
+
+        total_saved = deletion_saved + compression_saved + dormant_saved
+        curator_spent = curator_prompt_tokens + curator_resp_tokens
+
+        cost = {
+            "saved": {
+                "deletion": deletion_saved,
+                "compression": compression_saved,
+                "dormancy": dormant_saved,
+                "total": total_saved,
+            },
+            "spent": {
+                "prompt": curator_prompt_tokens,
+                "response": curator_resp_tokens,
+                "total": curator_spent,
+            },
+            "net": total_saved - curator_spent,
+        }
+
         # ── 13. 写日志 ──
         self._write_log(
             turn=self.turn,
@@ -163,6 +206,7 @@ class ContextCurator:
             parsed=parsed,
             stats=final_stats,
             skipped=False,
+            cost=cost,
         )
 
         return CuratorResult(
@@ -177,6 +221,7 @@ class ContextCurator:
 
     def _execute_gaps(self, gaps: List[KnowledgeGap]) -> List[GapResult]:
         results = []
+        seen_queries = set()
         for gap in gaps:
             if gap.type == "search" and self.config.search_fn:
                 try:
@@ -191,12 +236,19 @@ class ContextCurator:
                     f"[待用户确认] {gap.query}", "pending_ask"
                 ))
             elif gap.type == "memory" and self.config.memory_fn:
+                # 组装完整 query 列表, 去重避免连续两轮相同 gap 重复调用
+                queries = [gap.query] if gap.query else []
+                queries += gap.queries
+                key = json.dumps(queries, ensure_ascii=False)
+                if key in seen_queries:
+                    continue
+                seen_queries.add(key)
                 try:
-                    content = self.config.memory_fn(gap.query)
+                    content = self.config.memory_fn(queries if queries else [])
                     results.append(GapResult(content, "memory_recall"))
                 except Exception as e:
                     results.append(GapResult(
-                        f"[记忆查询失败] {gap.query}: {e}", "memory_recall"
+                        f"[记忆查询失败] queries={queries}: {e}", "memory_recall"
                     ))
             elif gap.type == "local_file" and self.config.file_read_fn:
                 try:
@@ -279,8 +331,9 @@ class ContextCurator:
     # ── 日志 ──
 
     def _write_log(self, turn: int, user_message: str, current_tokens: int,
-                   max_tokens: int, parsed, stats, skipped: bool):
-        """写 JSONL 日志, 记录每轮决策"""
+                   max_tokens: int, parsed, stats, skipped: bool,
+                   cost: Optional[dict] = None):
+        """写 JSONL 日志, 记录每轮决策和 token 成本"""
         if not self.config.log_path:
             return
 
@@ -303,7 +356,8 @@ class ContextCurator:
                 "adjustments": len(parsed.score_adjustments),
                 "deleted": parsed.delete_segments,
                 "compressed": [{"id": c.segment_id, "summary": c.summary[:100]} for c in parsed.compressions],
-                "knowledge_gaps": [{"type": g.type, "query": g.query} for g in parsed.knowledge_gaps if g.type != "none"],
+                "knowledge_gaps": [{"type": g.type, "query": g.query, "queries": g.queries} for g in parsed.knowledge_gaps if g.type != "none"],
+                "persisted": parsed.persist_segments,
             }
 
         entry["result"] = {
@@ -315,6 +369,9 @@ class ContextCurator:
             "score_distribution": stats.score_distribution,
         }
 
+        if cost is not None:
+            entry["cost"] = cost
+
         import json
         with open(self.config.log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -324,7 +381,7 @@ class ContextCurator:
     def _call_llm(self, prompt: str) -> str:
         client = self.config.llm_client
         if client is None:
-            return '{"strategy_update": null, "pinned_segments": [], "initial_scores": [], "score_adjustments": [], "delete_segments": [], "compressions": [], "knowledge_gaps": [{"type": "none", "query": "", "reason": ""}]}'
+            return '{"strategy_update": null, "pinned_segments": [], "initial_scores": [], "score_adjustments": [], "delete_segments": [], "compressions": [], "knowledge_gaps": [{"type": "none", "query": "", "queries": [], "reason": ""}], "persist_segments": []}'
 
         # 支持三种接口: callable(prompt) / client.chat(prompt) / client.chat(messages)
         if callable(client) and not hasattr(client, "chat"):

@@ -12,7 +12,9 @@ class ComplexityGate:
         self.skip_below_tokens = config.skip_below_tokens
         self.skip_patterns = [p.lower() for p in config.skip_patterns]
 
-    def should_skip(self, user_message: str, segment_store) -> bool:
+    def should_skip(self, user_message: str, segment_store,
+                    chars_per_token: float = 4.0,
+                    dormant_threshold: int = 3) -> bool:
         """满足任一条件返回 True, 跳过中间层"""
         msg = user_message.strip()
 
@@ -26,11 +28,11 @@ class ComplexityGate:
             if pattern in msg_lower:
                 return True
 
-        # 3. 上下文太少
-        active = segment_store.get_active()
+        # 3. 上下文太少 (只计对宿主可见的活跃段落)
+        active = segment_store.get_active_for_host(dormant_threshold)
         if len(active) < self.skip_below_segments:
             total_chars = sum(len(s.content) for s in active) + len(msg)
-            if total_chars / 4.0 < self.skip_below_tokens:
+            if total_chars / chars_per_token < self.skip_below_tokens:
                 return True
 
         return False

@@ -6,14 +6,17 @@
   - 压缩索引: LLM 压缩长段落为摘要, 原文存入外部索引可拉回
   - Pin 保护: [锁] 标记用户明确要求保留的内容
   - 预算感知: 四级压力自适应调整评分/压缩/淘汰策略
-  - 脚本执行: LLM 负责评分, 衰减/休眠/删除/淘汰由脚本执行
+  - 知识缺口检测: Step 0 推理链 — 分析意图 → 拆解前置知识 → 对照上下文 → 发现缺失发起检索
+  - 多 query 记忆召回: LLM 生成主 query + 同义变体, 提高召回覆盖率; 单 query 系统取 queries[0] 兜底
+  - 脚本执行: LLM 负责评分和缺口判断, 衰减/休眠/删除/淘汰由脚本执行
 
 使用:
-    from context_curator import ContextCurator, CuratorConfig
+    from context_curator import create_curator
 
-    config = CuratorConfig(llm_client=my_llm, db_path="curator.db")
-    curator = ContextCurator(config)
-
+    curator = create_curator(
+        max_tokens=80000,
+        memory_fn=lambda queries: mem0.search(queries),
+    )
     result = curator.curate(user_message)
     clean_context = result.context  # 传给主 Agent
 """

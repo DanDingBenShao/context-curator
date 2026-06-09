@@ -48,6 +48,7 @@ class KnowledgeGap:
     """知识缺口"""
     type: str   # search | ask_user | memory | local_file | none
     query: str = ""
+    queries: List[str] = field(default_factory=list)  # 多query: [主query, 同义变体1, ...]
     reason: str = ""
 
 
@@ -68,6 +69,7 @@ class CuratorOutput:
     strategy_update: Optional[str] = None
     delete_segments: List[str] = field(default_factory=list)
     pinned_segments: List[str] = field(default_factory=list)
+    persist_segments: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -138,7 +140,7 @@ class CuratorConfig:
 
     # 知识缺口回调 (可选, 由使用者注入)
     search_fn: Optional[Callable[[str], str]] = None
-    memory_fn: Optional[Callable[[str], str]] = None
+    memory_fn: Optional[Callable[[List[str]], str]] = None  # queries → 召回文本
     file_read_fn: Optional[Callable[[str], str]] = None
     on_ask_user: Optional[Callable[[str], str]] = None
     host_info_fn: Optional[Callable[[], str]] = None  # 返回宿主模型信息 JSON
